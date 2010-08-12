@@ -1,0 +1,199 @@
+﻿#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
+#JabberBot v.0.4
+import sys
+import os
+import xmpp
+import time
+import datetime
+import traceback
+import threading
+import sqlite3 as db
+    
+bot = None
+AUTO_RESTART=0
+
+def loadConfig():
+    import ConfigParser
+    config = ConfigParser.ConfigParser()
+    config.read('config.ini')
+    login = config.get('connect', 'login')
+    password = config.get('connect', 'password')
+    resource = config.get('connect', 'resource')
+    priority = config.get('connect', 'priority')
+    allow_password =  config.get('permission', 'allow_password')
+    user_no_pass =  config.get('permission', 'user_no_pass')
+    user_no_pass = user_no_pass.split(',')
+    dbpath = config.get('settings', 'dbpath')
+    return {'login':login,'password':password,'resource':resource,'priority':priority,\
+            'allow_password':allow_password,  'user_no_pass':user_no_pass, 'dbpath':dbpath}
+
+def loadPlugins():
+    import os
+    global bot
+    commands = []
+    public_commands = []
+    for fname in os.listdir('plugins/'):
+        if fname.endswith('.py'):
+           plugin_name = fname[:-3]
+           if plugin_name != '__init__':
+              plugins=__import__('plugins.'+plugin_name)
+              plugin = getattr(plugins,plugin_name)
+              type = plugin.init(bot)
+              if type==1:
+                 commands.append(plugin_name)
+              if type==0:
+                 public_commands.append(plugin_name)
+    return {'plugins':plugins,'commands':commands,  'public_commands':public_commands}
+
+def runPlugin(command,bot,mess):
+    plugin = getattr(bot.plugins['plugins'],command)
+    plugin.run(bot,mess)
+  
+
+# Thread run command
+class RunThread(threading.Thread):
+    # Override Thread's __init__ method to accept the parameters needed:
+    def __init__(self,command, bot, mess):
+        self.tmess = mess
+        self.tcommand = command
+        self.tbot = bot
+        threading.Thread.__init__(self)
+
+    def run(self):
+        try:
+            runPlugin(self.tcommand,self.tbot,self.tmess)
+            try: 
+                text = self.tmess.getBody()
+                user=self.tmess.getFrom()
+                conn = db.connect(self.tbot.dbpath,timeout=5.0)
+                conn.execute("insert into messages(dt, jid, message) values(?,?,?)",\
+                    (datetime.datetime.now(),str(user),text))
+                conn.commit()
+            except db.DatabaseError, x:
+                print x
+                print "Error db"
+        except Exception ,x:
+            print 'Error '+self.tcommand 
+            print x
+        
+def message_callback(conn,mess):
+    global bot
+    try:
+          text = mess.getBody()
+          if ( text == None ):
+             return
+          bot.mess_count = bot.mess_count + 1
+          command = text.split(' ')
+          command = command[0]
+          user=mess.getFrom()
+              
+          if command in bot.plugins['public_commands']:
+             RunThread(command,bot,mess).start()
+             return
+          user=str(user).split('/')
+          user=user[0]
+          if user not in bot.config['user_no_pass']:
+             text = "wrong command. try 'help'"
+             bot.send(xmpp.Message(mess.getFrom(),text))
+             return
+          if command in bot.plugins['commands']:
+             RunThread(command,bot,mess).start()
+             return
+          else:
+             text = "wrong command. try 'help'"
+    except Exception ,x:
+        print x
+        text = "Error:wrong command. try 'help'"
+    bot.send(xmpp.Message(mess.getFrom(),text))
+
+################################################################################
+
+def start():
+    global bot
+    global LOGGEDIN
+    LOGGEDIN = 0
+    config = loadConfig()
+    acc = xmpp.JID(config['login']) 
+    user,server=acc.getNode(),acc.getDomain()
+    bot = xmpp.Client(server,debug=[])
+    bot.mess_count = 0
+    bot.config = config
+
+    if bot.connect():
+        print "Connected"
+    else:
+        print "Couldn't connect"
+        sys.exit(1)
+
+    if bot.auth(user,bot.config['password'],bot.config['resource']):
+        print 'Logged In'
+    else:
+        print "Auth error: eek -> ", bot.lastErr, bot.lastErrCode
+        time.sleep(60) # sleep for 10 seconds
+        sys.exit(1)
+       
+   
+       
+    bot.roster = bot.getRoster()
+
+    bot.dbpath = bot.config['dbpath']
+    print bot.dbpath
+    bot.dbpath = u'd:\\ГЫ\\JabberBot\\bot.db' 
+    bot.conn = db.connect(bot.dbpath,timeout=5.0)
+    #создать таблицу (для первой инициализации базы)
+    table=bot.conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' and name='messages'").fetchone()[0];
+    if (table==0):
+        bot.conn.execute("create table messages(dt TIMESTAMP, jid, message)")
+        
+    bot.start_date = datetime.datetime.now()
+    
+    bot.plugins = loadPlugins()
+    print "Plugin loaded."
+
+    bot.RegisterDisconnectHandler(bot.reconnectAndReauth)
+    bot.RegisterHandler('message',message_callback)
+    bot.sendInitPresence()
+    bot.start_date = datetime.datetime.now()
+    print "Bot started."
+
+    presence = xmpp.Presence(status = "", show = "online", priority = bot.config['priority'])
+    bot.send(presence)
+
+    #for admin in bot.config['user_no_pass']:
+    #    bot.send(xmpp.Message(admin,"Bot started - "+str(bot.start_date)))
+
+    LOGGEDIN = 1
+
+    while 1:
+        bot.Process(10)
+
+
+if __name__ == "__main__":
+    try:	
+        #config = loadConfig()
+        start()
+    except KeyboardInterrupt:
+        print 'INTERRUPT'
+        sys.exit(1)
+    except:
+        if AUTO_RESTART:
+            if sys.exc_info()[0] is not SystemExit:
+                traceback.print_exc()
+            try:
+                bot.disconnected()
+            except IOError:
+                # IOError is raised by default DisconnectHandler
+                pass
+            try:
+                time.sleep(3)
+            except KeyboardInterrupt:
+                print 'INTERRUPT'
+                sys.exit(1)
+            print 'RESTARTING'
+            os.execl(sys.executable, sys.executable, sys.argv[0])
+        else:
+            raise
+
+#EOF
